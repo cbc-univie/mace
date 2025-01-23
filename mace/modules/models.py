@@ -62,7 +62,6 @@ class MACE(torch.nn.Module):
         radial_MLP: Optional[List[int]] = None,
         radial_type: Optional[str] = "bessel",
         heads: Optional[List[str]] = None,
-        cueq_config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.register_buffer(
@@ -83,9 +82,7 @@ class MACE(torch.nn.Module):
         node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
         node_feats_irreps = o3.Irreps([(hidden_irreps.count(o3.Irrep(0, 1)), (0, 1))])
         self.node_embedding = LinearNodeEmbeddingBlock(
-            irreps_in=node_attr_irreps,
-            irreps_out=node_feats_irreps,
-            cueq_config=cueq_config,
+            irreps_in=node_attr_irreps, irreps_out=node_feats_irreps
         )
         self.radial_embedding = RadialEmbeddingBlock(
             r_max=r_max,
@@ -96,7 +93,7 @@ class MACE(torch.nn.Module):
         )
         edge_feats_irreps = o3.Irreps(f"{self.radial_embedding.out_dim}x0e")
         if pair_repulsion:
-            self.pair_repulsion_fn = ZBLBasis(p=num_polynomial_cutoff)
+            self.pair_repulsion_fn = ZBLBasis(r_max=r_max, p=num_polynomial_cutoff)
             self.pair_repulsion = True
 
         sh_irreps = o3.Irreps.spherical_harmonics(max_ell)
@@ -119,7 +116,6 @@ class MACE(torch.nn.Module):
             hidden_irreps=hidden_irreps,
             avg_num_neighbors=avg_num_neighbors,
             radial_MLP=radial_MLP,
-            cueq_config=cueq_config,
         )
         self.interactions = torch.nn.ModuleList([inter])
 
@@ -135,15 +131,12 @@ class MACE(torch.nn.Module):
             correlation=correlation[0],
             num_elements=num_elements,
             use_sc=use_sc_first,
-            cueq_config=cueq_config,
         )
         self.products = torch.nn.ModuleList([prod])
 
         self.readouts = torch.nn.ModuleList()
         self.readouts.append(
-            LinearReadoutBlock(
-                hidden_irreps, o3.Irreps(f"{len(heads)}x0e"), cueq_config
-            )
+            LinearReadoutBlock(hidden_irreps, o3.Irreps(f"{len(heads)}x0e"))
         )
 
         for i in range(num_interactions - 1):
@@ -162,7 +155,6 @@ class MACE(torch.nn.Module):
                 hidden_irreps=hidden_irreps_out,
                 avg_num_neighbors=avg_num_neighbors,
                 radial_MLP=radial_MLP,
-                cueq_config=cueq_config,
             )
             self.interactions.append(inter)
             prod = EquivariantProductBasisBlock(
@@ -171,7 +163,6 @@ class MACE(torch.nn.Module):
                 correlation=correlation[i + 1],
                 num_elements=num_elements,
                 use_sc=True,
-                cueq_config=cueq_config,
             )
             self.products.append(prod)
             if i == num_interactions - 2:
@@ -182,14 +173,11 @@ class MACE(torch.nn.Module):
                         gate,
                         o3.Irreps(f"{len(heads)}x0e"),
                         len(heads),
-                        cueq_config,
                     )
                 )
             else:
                 self.readouts.append(
-                    LinearReadoutBlock(
-                        hidden_irreps, o3.Irreps(f"{len(heads)}x0e"), cueq_config
-                    )
+                    LinearReadoutBlock(hidden_irreps, o3.Irreps(f"{len(heads)}x0e"))
                 )
 
     def forward(
@@ -202,6 +190,7 @@ class MACE(torch.nn.Module):
         compute_displacement: bool = False,
         compute_hessian: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
+
         # Setup
         data["node_attrs"].requires_grad_(True)
         data["positions"].requires_grad_(True)
@@ -352,6 +341,7 @@ class ScaleShiftMACE(MACE):
         # Setup
         data["positions"].requires_grad_(True)
         data["node_attrs"].requires_grad_(True)
+
         num_graphs = data["ptr"].numel() - 1
         num_atoms_arange = torch.arange(data["positions"].shape[0])
         node_heads = (
@@ -462,6 +452,128 @@ class ScaleShiftMACE(MACE):
             "displacement": displacement,
             "node_feats": node_feats_out,
         }
+        return output
+
+
+@compile_mode("script")
+class AlchemicalScaleShiftMACE(MACE):
+    def __init__(
+        self,
+        atomic_inter_scale: float,
+        atomic_inter_shift: float,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.scale_shift = ScaleShiftBlock(
+            scale=atomic_inter_scale, shift=atomic_inter_shift
+        )
+        print("################################")
+        print("Alchemical MACE v1.1")
+        print("################################")
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_hessian: bool = False,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+
+        data["positions"].requires_grad_(True)
+        data["node_attrs"].requires_grad_(True)
+
+        # Setup
+        vectors = data["vectors"]
+        lengths = data["lengths"]
+
+        num_graphs = data["ptr"].numel() - 1
+        num_atoms_arange = torch.arange(data["positions"].shape[0])
+        node_heads = (
+            data["head"][data["batch"]]
+            if "head" in data
+            else torch.zeros_like(data["batch"])
+        )
+        displacement = torch.zeros(
+            (num_graphs, 3, 3),
+            dtype=data["positions"].dtype,
+            device=data["positions"].device,
+        )
+
+        # Atomic energies
+        node_e0 = self.atomic_energies_fn(data["node_attrs"])[
+            num_atoms_arange, node_heads
+        ]
+        e0 = scatter_sum(
+            src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
+        )  # [n_graphs, num_heads]
+
+        # Embeddings
+        node_feats = self.node_embedding(data["node_attrs"])
+        edge_attrs = self.spherical_harmonics(vectors)
+        edge_feats = self.radial_embedding(
+            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+        )
+
+        pair_node_energy = torch.zeros_like(node_e0)
+        # Interactions
+        node_es_list = [pair_node_energy]
+        node_feats_list = []
+        for interaction, product, readout in zip(
+            self.interactions, self.products, self.readouts
+        ):
+            node_feats, sc = interaction(
+                node_attrs=data["node_attrs"],
+                node_feats=node_feats,
+                edge_attrs=edge_attrs,
+                edge_feats=edge_feats,
+                edge_index=data["edge_index"],
+            )
+            node_feats = product(
+                node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"]
+            )
+            node_feats_list.append(node_feats)
+            node_es_list.append(
+                readout(node_feats, node_heads)[num_atoms_arange, node_heads]
+            )  # {[n_nodes, ], }
+        # Concatenate node features
+        node_feats_out = torch.cat(node_feats_list, dim=-1)
+        # Sum over interactions
+        node_inter_es = torch.sum(
+            torch.stack(node_es_list, dim=0), dim=0
+        )  # [n_nodes, ]
+        node_inter_es = self.scale_shift(node_inter_es, node_heads)
+
+        # Sum over nodes in graph
+        inter_e = scatter_sum(
+            src=node_inter_es, index=data["batch"], dim=-1, dim_size=num_graphs
+        )  # [n_graphs,]
+
+        # Add E_0 and (scaled) interaction energy
+        total_energy = e0 + inter_e
+        node_energy = node_e0 + node_inter_es
+        forces, virials, stress, hessian = get_outputs(
+            energy=inter_e,
+            positions=data["positions"],
+            displacement=displacement,
+            cell=data["cell"],
+            training=training,
+            compute_force=compute_force,
+            compute_virials=False,
+            compute_stress=False,
+            compute_hessian=compute_hessian,
+        )
+        output = {
+            "energy": total_energy,
+            "node_energy": node_energy,
+            "interaction_energy": inter_e,
+            "forces": forces,
+            "virials": virials,
+            "stress": stress,
+            "hessian": hessian,
+            "displacement": displacement,
+            "node_feats": node_feats_out,
+            "lengths": lengths,
+        }
 
         return output
 
@@ -483,7 +595,6 @@ class BOTNet(torch.nn.Module):
         gate: Optional[Callable],
         avg_num_neighbors: float,
         atomic_numbers: List[int],
-        cueq_config: Optional[Dict[str, Any]] = None,  # pylint: disable=unused-argument
     ):
         super().__init__()
         self.r_max = r_max
@@ -688,7 +799,6 @@ class AtomicDipolesMACE(torch.nn.Module):
         ],  # Just here to make it compatible with energy models, MUST be None
         radial_type: Optional[str] = "bessel",
         radial_MLP: Optional[List[int]] = None,
-        cueq_config: Optional[Dict[str, Any]] = None,  # pylint: disable=unused-argument
     ):
         super().__init__()
         self.register_buffer(
@@ -890,7 +1000,6 @@ class EnergyDipolesMACE(torch.nn.Module):
         gate: Optional[Callable],
         atomic_energies: Optional[np.ndarray],
         radial_MLP: Optional[List[int]] = None,
-        cueq_config: Optional[Dict[str, Any]] = None,  # pylint: disable=unused-argument
     ):
         super().__init__()
         self.register_buffer(
